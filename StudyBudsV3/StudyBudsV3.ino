@@ -1,5 +1,6 @@
 #include <Servo.h>
 #include <LiquidCrystal_I2C.h>
+#include <avr/interrupt.h>
 
 struct LeafConfig {
   uint8_t servoPin;    // PWM pin for servo motor
@@ -25,6 +26,84 @@ const LeafConfig LEAVES[4] = {
 const int pinR = 44;
 const int pinG = 45;
 const int pinB = 46;
+
+// ---- LED colors (0-255) ----
+// Focus (no votes): Blue #648FFF -> (100, 143, 255)
+const uint8_t COLOR_FOCUS_R   = 100;
+const uint8_t COLOR_FOCUS_G   = 143;
+const uint8_t COLOR_FOCUS_B   = 255;
+
+// Focus (someone voted): Yellow #FFB000 -> (255, 176, 0)
+const uint8_t COLOR_VOTED_R   = 255;
+const uint8_t COLOR_VOTED_G   = 176;
+const uint8_t COLOR_VOTED_B   = 0;
+
+// Break: Pink #DC267F -> (220, 38, 127)
+const uint8_t COLOR_BREAK_R   = 220;
+const uint8_t COLOR_BREAK_G   = 38;
+const uint8_t COLOR_BREAK_B   = 127;
+
+// Vote blink: Orange #FE6100 -> (254, 97, 0)
+const uint8_t COLOR_BLINK_R   = 254;
+const uint8_t COLOR_BLINK_G   = 97;
+const uint8_t COLOR_BLINK_B   = 0;
+
+// Blink timings for vote feedback
+const uint16_t VOTE_BLINK_TOTAL_MS  = 1000;  // total duration of orange blink feedback
+const uint16_t VOTE_BLINK_TOGGLE_MS = 250;   // on/off toggle interval during blink
+
+// ---- Software PWM for RGB on pins 44/45/46 (Timer5 is taken by Servo) ----
+#if defined(__AVR_ATmega2560__) || defined(__AVR_ATmega1280__)
+#define USE_SOFTPWM_RGB 1
+#else
+#define USE_SOFTPWM_RGB 0
+#endif
+
+#if USE_SOFTPWM_RGB
+// Pins 44,45,46 map to PORTL bits 5,4,3 respectively on Mega
+#define LED_PORT   PORTL
+#define LED_DDR    DDRL
+#define LED_R_BIT  5  // D44
+#define LED_G_BIT  4  // D45
+#define LED_B_BIT  3  // D46
+
+volatile uint8_t rgbDutyR = 0;
+volatile uint8_t rgbDutyG = 0;
+volatile uint8_t rgbDutyB = 0;
+volatile uint8_t rgbCounter = 0; // 0..255 ramp
+
+void initRGBSoftPWM() {
+  // Ensure pins are outputs (redundant with pinMode but cheap)
+  LED_DDR |= (1 << LED_R_BIT) | (1 << LED_G_BIT) | (1 << LED_B_BIT);
+
+  // Timer2 CTC at 16 kHz: prescaler 8, OCR2A = 124 => 16e6 / (8*(124+1)) = 16 kHz
+  TCCR2A = _BV(WGM21);               // CTC mode
+  TCCR2B = _BV(CS21);                // prescaler 8
+  OCR2A  = 124;                      // compare value
+  TIMSK2 |= _BV(OCIE2A);             // enable compare match A interrupt
+}
+
+ISR(TIMER2_COMPA_vect) {
+  uint8_t c = rgbCounter + 1; // 0..255
+  rgbCounter = c;
+
+  // Start of a new PWM cycle: set outputs high for non-zero duty
+  if (c == 0) {
+    uint8_t maskOn = 0;
+    if (rgbDutyR) maskOn |= (1 << LED_R_BIT);
+    if (rgbDutyG) maskOn |= (1 << LED_G_BIT);
+    if (rgbDutyB) maskOn |= (1 << LED_B_BIT);
+    LED_PORT |= maskOn;
+  }
+
+  // Turn channels off when the counter reaches their duty value
+  uint8_t maskOff = 0;
+  if (c == rgbDutyR) maskOff |= (1 << LED_R_BIT);
+  if (c == rgbDutyG) maskOff |= (1 << LED_G_BIT);
+  if (c == rgbDutyB) maskOff |= (1 << LED_B_BIT);
+  LED_PORT &= ~maskOff;
+}
+#endif // USE_SOFTPWM_RGB
 
 const uint8_t NUM_LEAVES = sizeof(LEAVES) / sizeof(LEAVES[0]); // Calculate number of leaves dynamically
 
@@ -80,6 +159,12 @@ uint32_t lastLCDUpdateMs = 0;
 const uint16_t LCD_UPDATE_MS = 1000; // Update LCD every second
 uint8_t lcdAnimationDots = 0;        // 0-3 for "Studying", "Studying.", "Studying..", "Studying..."
 uint8_t breakScreenToggle = 0;       // 0-1 for alternating break screens
+
+// LED vote-blink state
+bool voteBlinkActive = false;
+uint32_t voteBlinkUntilMs = 0;
+uint32_t voteBlinkToggleAtMs = 0;
+bool voteBlinkOn = false;
 
 float readDistanceCm(const LeafConfig& leaf) {
   // Trigger pulse
@@ -261,15 +346,71 @@ void setup() {
   pinMode(pinG, OUTPUT);
   pinMode(pinB, OUTPUT);
 
+#if USE_SOFTPWM_RGB
+  initRGBSoftPWM();
+  // Initialize LED to idle/break color on boot for immediate feedback
+  setLEDColor(COLOR_BREAK_R, COLOR_BREAK_G, COLOR_BREAK_B);
+#endif
+
   // Maybe: give a grace period on power-up before the leaves are lowered
   // refractoryUntilMs = millis() + BREAK_TIME;
 }
 
-//Sets the flower LED color given 3 parameters (R,G,B)
-void setLEDColor(int red, int green, int blue){
-  analogWrite(pinR,red);   // 0-255
-  analogWrite(pinG,green); // 0-255
-  analogWrite(pinB,blue);  // 0-255
+//Sets the flower LED color given 3 parameters (R,G,B) — matches reference helper
+void setLEDColor(uint8_t red, uint8_t green, uint8_t blue){
+#if USE_SOFTPWM_RGB
+  // Use software PWM on 44/45/46 so colors work with Servo (Timer5)
+  rgbDutyR = red;
+  rgbDutyG = green;
+  rgbDutyB = blue;
+#else
+  // Fallback to hardware PWM if available
+  analogWrite(pinR, red);
+  analogWrite(pinG, green);
+  analogWrite(pinB, blue);
+#endif
+}
+
+// Decide and apply LED color based on session/break/votes, with vote-blink override
+void updateLED(uint32_t now, bool refractoryActive) {
+  // Handle transient orange blink on a new valid vote
+  if (voteBlinkActive) {
+    if ((int32_t)(now - voteBlinkUntilMs) >= 0) {
+      voteBlinkActive = false; // blink window over
+    } else {
+      if ((int32_t)(now - voteBlinkToggleAtMs) >= 0) {
+        voteBlinkToggleAtMs = now + VOTE_BLINK_TOGGLE_MS;
+        voteBlinkOn = !voteBlinkOn;
+      }
+      if (voteBlinkOn) {
+        setLEDColor(COLOR_BLINK_R, COLOR_BLINK_G, COLOR_BLINK_B);
+      } else {
+        setLEDColor(0, 0, 0);
+      }
+      return; // during blink, override baseline state
+    }
+  }
+
+  // Baseline LED: Break -> Pink, Focus (voted) -> Yellow, Focus -> Blue, Idle -> Pink
+  if (refractoryActive) {
+    setLEDColor(COLOR_BREAK_R, COLOR_BREAK_G, COLOR_BREAK_B);
+    return;
+  }
+
+  if (sessionActive) {
+    bool anyValidVote = false;
+    for (int i = 0; i < NUM_LEAVES; ++i) {
+      if (leafStates[i] == LEAF_CLOSED && votePressed[i]) { anyValidVote = true; break; }
+    }
+    if (anyValidVote) {
+      setLEDColor(COLOR_VOTED_R, COLOR_VOTED_G, COLOR_VOTED_B);
+    } else {
+      setLEDColor(COLOR_FOCUS_R, COLOR_FOCUS_G, COLOR_FOCUS_B);
+    }
+  } else {
+    // Idle (not in break, no active session)
+    setLEDColor(COLOR_BREAK_R, COLOR_BREAK_G, COLOR_BREAK_B);
+  }
 }
 
 // ---- NEW: helper to print distances with pin info every 0.2s ----
@@ -320,8 +461,19 @@ void loop() {
   // Latch each participant's private break vote during an active session
   if (now - lastBtnSampleMs >= BTN_SAMPLE_MS) {
     lastBtnSampleMs = now;
-    for (int i = 0; i < NUM_LEAVES; ++i) {
-      if (digitalRead(LEAVES[i].buttonPin) == LOW) votePressed[i] = true; // active LOW
+    if (sessionActive) {
+      for (int i = 0; i < NUM_LEAVES; ++i) {
+        bool pressed = (digitalRead(LEAVES[i].buttonPin) == LOW); // active LOW
+        // A vote is valid only if the corresponding leaf is currently closed
+        if (pressed && !votePressed[i] && leafStates[i] == LEAF_CLOSED) {
+          votePressed[i] = true;
+          // Start transient orange blink to acknowledge the new valid vote
+          voteBlinkActive = true;
+          voteBlinkUntilMs = now + VOTE_BLINK_TOTAL_MS;
+          voteBlinkToggleAtMs = now; // toggle immediately on next update
+          voteBlinkOn = true;
+        }
+      }
     }
   }
 
@@ -330,8 +482,6 @@ void loop() {
 
   // Handle individual leaf closing when not in refractory period
   if (!refractoryActive) {
-
-    setLEDColor(0,123,255);
 
     for (int i = 0; i < NUM_LEAVES; ++i) {
       if (leafStates[i] == LEAF_OPEN && distances[i] <= TRIP_CM) {
@@ -366,7 +516,6 @@ void loop() {
 
     if (timeUp || votePass) {
       // Open all leaves together
-      setLEDColor(0,0,0);
       moveAllServosSmooth(SERVO_OPEN_POS, OPEN_STEP_DEG, OPEN_DWELL_MS);
 
       // Reset all leaf states
@@ -377,10 +526,16 @@ void loop() {
 
       sessionActive = false;
       refractoryUntilMs = now + BREAK_TIME; // start shared break period
+      // End any pending vote blink when session transitions to break
+      voteBlinkActive = false;
     }
   }
+
+  // Recompute refractory flag after any possible changes above to ensure immediate LED update
+  bool refractoryForLED = ((int32_t)(now - refractoryUntilMs) < 0);
+  // Apply LED color for the current state (runs after state transitions above)
+  updateLED(now, refractoryForLED);
 
   // Small idle keeps motion smooth and gives sensors breathing room
   delay(2);
 }
-
